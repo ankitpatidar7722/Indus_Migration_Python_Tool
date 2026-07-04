@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Virtual environment
+myenv/
+venv/
+.venv/
+
+# PyInstaller build artifacts
+build/
+dist/
+*.spec.bak
+
+# Local DB credentials + runtime config (never commit)
+connection.json
+
+# Logs
+*.log
+migration_errors.log
+
+# Old ASP.NET/VB reference code (contains hardcoded credentials — kept local only)
+Product Catalog Save/
+
+# Editor / tooling
+.claude/
+.vscode/
+.idea/
+*.swp
+.DS_Store
