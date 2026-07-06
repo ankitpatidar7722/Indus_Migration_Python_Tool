@@ -350,6 +350,11 @@ class _ItemBase(MappedEntity):
             for f in list(self.eav_defaults) + ["ProductHSNName"]:
                 if f not in fields:
                     fields = fields + [f]
+        # Never let a bool_detail_field (IsStandardItem/IsRegularItem) come through
+        # as a plain EAV row (value 0/1) — for Paper/Reel/Roll the group-field list
+        # includes them, which previously produced a duplicate '0' row alongside the
+        # 'True'/'False' one below. They are emitted ONCE, as True/False, right after.
+        fields = [f for f in fields if f not in self.bool_detail_fields]
         cols, rows = build_eav_detail_rows(
             "ItemMasterDetails", "ItemID", "ItemGroupID", parent_id, gid,
             parent_map, fields, self.company_id, self.user_id, self.fyear,
@@ -452,6 +457,9 @@ class ReelMigration(_ItemBase):
     item_type_value = "REEL"
     est_unit_source_col = "PO_Rate_Type"        # EstimationUnit (reel uses PO_Rate_Type)
     est_rate_source_col = "Rate_To_Charge"      # EstimationRate
+    # Reel has no desktop "standard" flag, so IsStandardItem defaults to False —
+    # emitted as ONE True/False detail row (never a numeric 0/1), like Roll.
+    bool_detail_fields = ["IsStandardItem"]
 
 
 class RollMigration(_ItemBase):
@@ -499,9 +507,14 @@ class RollMigration(_ItemBase):
 
     def corrections(self, row):
         out = super().corrections(row)
-        # QA: ItemType = Roll_Type_Name.
-        if row.get("Roll_Type_Name"):
-            out["ItemType"] = row.get("Roll_Type_Name")
+        # QA: ItemType from Roll_Type_Name, with mapping corrections:
+        # 'Paper Roll' -> 'Paper', 'Film Roll' -> 'Film'; any other value kept as-is.
+        rtn = row.get("Roll_Type_Name")
+        if rtn:
+            out["ItemType"] = {
+                "paper roll": "Paper",
+                "film roll": "Film",
+            }.get(str(rtn).strip().lower(), rtn)
         # QA: round PurchaseRate and EstimationRate to 2 decimals.
         for fld, src in (("PurchaseRate", "Basic_Rate"),
                          ("EstimationRate", "Rate_To_Be_Charged")):
@@ -511,6 +524,14 @@ class RollMigration(_ItemBase):
                     out[fld] = round(float(v), 2)
             except (TypeError, ValueError):
                 pass
+        # QA: round Density to 3 decimals (applies to both ItemMaster.Density and
+        # its ItemMasterDetails EAV row, which build from this corrected value).
+        dv = row.get("Density")
+        try:
+            if dv is not None and str(dv).strip() != "":
+                out["Density"] = round(float(dv), 3)
+        except (TypeError, ValueError):
+            pass
         # QA: if PurchaseUnit/StockUnit empty, fall back to EstimationUnit.
         # Roll_Master has no purchase/stock unit column, so these are always
         # filled from the estimation unit (the desktop "rate type").

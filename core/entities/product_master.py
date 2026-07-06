@@ -245,7 +245,7 @@ CONTENT_SIZE_FIELDS = [
     ("PlanContDomainType", "Module_Type", "Offset"),
     ("Planlabeltype", "Label_Type", "null"),
     ("Planwindingdirection", "Winding_Direction", ""),
-    ("Planfinishedformat", None, "null"),
+    ("Planfinishedformat", "Finish_Type", "null"),
     ("Plandietype", None, ""),
     ("PlanPcsPerRoll", "Finish_Qty_Per_Roll", "0"),
     ("PlanCoreInnerDia", None, "0"),
@@ -574,20 +574,33 @@ class ProductMasterMigration(EntityMigration):
 
     # ---- read + bulk-load children ----------------------------------------
     def _ensure_desktop_id_column(self):
-        """The team's reference SQL joins on ProductMaster.DesktopProductMasterID.
-        Add it (idempotently) so those queries work; we populate it alongside
-        RefProductMasterID at insert time."""
-        try:
-            exists = db.query_web(
-                "SELECT 1 c FROM sys.columns WHERE object_id=OBJECT_ID('ProductMaster') "
-                "AND name='DesktopProductMasterID'")
-            if not exists:
-                cur = db.get_web().cursor()
-                cur.execute("ALTER TABLE ProductMaster ADD DesktopProductMasterID BIGINT NULL")
-                db.get_web().commit()
-                engine.reset_schema_caches()   # new column now visible to inserts
-        except Exception:
-            db.get_web().rollback()
+        """The team's reference SQL joins the desktop and web DBs on the original
+        desktop ids, so we add (idempotently) the back-pointer columns and populate
+        them at insert time:
+          * ProductMaster.DesktopProductMasterID (BIGINT)  <- Product_Master_ID
+          * ProductMasterContents.DesktopProductContentID (NVARCHAR) <- Product_Content_ID
+            (desktop Product_Content_ID is an nvarchar composite id like
+            'SL05170/26-27[1/1]', so the column is NVARCHAR, not numeric)."""
+        altered = False
+        for table, col, ddl in (
+            ("ProductMaster", "DesktopProductMasterID",
+             "ALTER TABLE ProductMaster ADD DesktopProductMasterID BIGINT NULL"),
+            ("ProductMasterContents", "DesktopProductContentID",
+             "ALTER TABLE ProductMasterContents ADD DesktopProductContentID NVARCHAR(100) NULL"),
+        ):
+            try:
+                exists = db.query_web(
+                    "SELECT 1 c FROM sys.columns WHERE object_id=OBJECT_ID(?) "
+                    "AND name=?", [table, col])
+                if not exists:
+                    cur = db.get_web().cursor()
+                    cur.execute(ddl)
+                    db.get_web().commit()
+                    altered = True
+            except Exception:
+                db.get_web().rollback()
+        if altered:
+            engine.reset_schema_caches()       # new columns now visible to inserts
 
     def read_source(self):
         self._ensure_desktop_id_column()
@@ -624,7 +637,7 @@ class ProductMasterMigration(EntityMigration):
                 "Product_Master_ID", "Content_ID", "Product_Content_ID",
                 "Machine_ID", "Paper_ID", "Is_Planned", "Actual_Sheets",
                 "Paper_Rate", "Gripper_Main", "Paper_Search_String",
-                "Finish_Type"], ids, "Product_Master_ID"),
+                "Finish_Type", "Plan_Type"], ids, "Product_Master_ID"),
             "Product_Master_ID")
         self._ops = self._group(self._read_children(
             "Product_Master_Operations", list(self._process_map) + [
@@ -663,6 +676,7 @@ class ProductMasterMigration(EntityMigration):
         self._build_full_maps()
         if self._contents:
             return                      # already loaded (e.g. run_entity path)
+        self._ensure_desktop_id_column()   # ensure back-pointer cols on the import path too
         ids = [p["Product_Master_ID"] for p in db.query_desktop(
             "SELECT Product_Master_ID FROM Product_Master WHERE ISNULL(Is_Hidden,0)=0")]
         self._load_children(ids)
@@ -1137,18 +1151,25 @@ class ProductMasterMigration(EntityMigration):
         return str(c.get("Orientation") or "").strip().lower() == "rectangular"
 
     @staticmethod
+    def _is_flexo_planning(c):
+        """True when the content's desktop Plan_Type is 'Flexo Planning'."""
+        return str(c.get("Plan_Type") or "").strip().lower() == "flexo planning"
+
+    @staticmethod
     def _plan_plate_bearer(c):
-        """PlanPlateBearer = desktop Color_Strip — the SINGLE source used for both
+        """PlanPlateBearer: for Plan_Type 'Flexo Planning' -> desktop Color_Strip;
+        for every other plan type -> 0. SINGLE source for both
         ProductMasterContentsSpecification.PlanPlateBearer and the ContentSizeValues
         string, so the two never diverge."""
-        return c.get("Color_Strip")
+        return c.get("Color_Strip") if ProductMasterMigration._is_flexo_planning(c) else 0
 
     @staticmethod
     def _plan_color_strip(c):
-        """PlanColorStrip = desktop Wastage_Strip — the SINGLE source used for both
+        """PlanColorStrip: for Plan_Type 'Flexo Planning' -> fixed 1.5; for every
+        other plan type -> desktop Color_Strip. SINGLE source for both
         ProductMasterContentsSpecification.PlanColorStrip and the ContentSizeValues
         string, so the two never diverge."""
-        return c.get("Wastage_Strip")
+        return 1.5 if ProductMasterMigration._is_flexo_planning(c) else c.get("Color_Strip")
 
     @staticmethod
     def _plan_gripper(c):
@@ -1156,6 +1177,22 @@ class ProductMasterMigration(EntityMigration):
         ProductMasterContentsSpecification.PlanGripper and the ContentSizeValues
         string, so the two never diverge."""
         return c.get("Gripper_Main")
+
+    @staticmethod
+    def _finish_type_value(raw):
+        """Map desktop Finish_Type -> web OutputType / Planfinishedformat:
+          Roll->'Roll Form', Sheet->'Sheet Form', Fan Fold->'Fan Fold',
+          Cut Label->'Cut Label', Pcs/Unit->'Pcs Or Unit'. Blank/unknown -> raw.
+          SINGLE source used for OutputType, Planfinishedformat, and the CSV string."""
+        s = ("" if raw is None else str(raw)).strip()
+        return {
+            "roll": "Roll Form",
+            "sheet": "Sheet Form",
+            "fan fold": "Fan Fold",
+            "cut label": "Cut Label",
+            "pcs": "Pcs Or Unit",
+            "unit": "Pcs Or Unit",
+        }.get(s.lower(), raw)
 
     @staticmethod
     def _parse_paper_search(s):
@@ -1231,8 +1268,9 @@ class ProductMasterMigration(EntityMigration):
             # PlanContDomainType = ContentMaster.ContentDomainType matched by the
             # content type (PlanContentType) -> ContentName (None -> default below).
             "PlanContDomainType": resolve_content_domain_type(c.get("Orientation")),
-            # PlanPlateBearer (=Color_Strip) and PlanColorStrip (=Wastage_Strip) must
-            # match ProductMasterContentsSpecification (same values), for consistency.
+            # PlanPlateBearer / PlanColorStrip are Plan_Type-conditional (Flexo
+            # Planning vs other) and must match ProductMasterContentsSpecification
+            # exactly — computed by the same single-source helpers.
             "PlanPlateBearer": self._plan_plate_bearer(c),
             "PlanColorStrip": self._plan_color_strip(c),
             # ChkPaperByClient per the desktop paperBy(Paper_By) rule.
@@ -1252,6 +1290,15 @@ class ProductMasterMigration(EntityMigration):
         derived["ItemPlanGsm"] = _g
         derived["ItemPlanMill"] = _m
         derived["ItemPlanFinish"] = _f
+        # ItemPlanThickness = web ItemMaster.Thickness of the resolved paper — the
+        # SAME value written to ProductMasterContentsSpecification.ItemPlanThickness.
+        derived["ItemPlanThickness"] = self._paper_thickness(c)
+        # Planfinishedformat = mapped Finish_Type (Roll->'Roll Form', ...), matching
+        # ProductMasterContentsSpecification.Planfinishedformat exactly.
+        derived["Planfinishedformat"] = self._finish_type_value(c.get("Finish_Type"))
+        # PlanOnlineCoating must match ProductMasterContentsSpecification.PlanOnlineCoating
+        # (both = desktop Online_Coating), for consistency between the two.
+        derived["PlanOnlineCoating"] = c.get("Online_Coating")
         if self._is_label(c):
             # Label: SizeWidth uses Job_Length; SizeLength is not populated (0).
             derived["SizeWidth"] = c.get("Job_Length")
@@ -1304,6 +1351,13 @@ class ProductMasterMigration(EntityMigration):
         if self._is_label(c):
             put("JobSize", self._label_lw(c.get("Job_Size")))
             put("JobCloseSize", self._label_lw(c.get("Job_Close_Size")))
+        # Desktop back-pointer: store the original nvarchar Product_Content_ID so
+        # desktop<->web joins/sync can match this content row later. Stored as-is.
+        put("DesktopProductContentID", c.get("Product_Content_ID"))
+        # OutputType <- Finish_Type ; PcsPerRoll <- Finish_Qty_Per_Roll (mirrored in
+        # the Specification row as Planfinishedformat / PlanPcsPerRoll).
+        put("OutputType", self._finish_type_value(c.get("Finish_Type")))
+        put("PcsPerRoll", c.get("Finish_Qty_Per_Roll"))
         # links + generated content no
         put("ProductMasterID", product_id)
         put("ProductMasterCode", pm_code)
@@ -1453,12 +1507,17 @@ class ProductMasterMigration(EntityMigration):
         # SizeBottomflapPer = (Bottom_Flap * 100) / Job_Width.
         put("SizeBottomflapPer", self._div(self._num(c.get("Bottom_Flap")) * 100,
                                            c.get("Job_Width")))
-        # PlanPlateBearer = Color_Strip; PlanColorStrip = Wastage_Strip;
+        # PlanPlateBearer = Color_Strip; PlanColorStrip = fixed 1.5;
         # PlanGripper = Gripper_Main. Same values used in the ContentSizeValues
         # string (see _plan_plate_bearer / _plan_color_strip / _plan_gripper).
         put("PlanPlateBearer", self._plan_plate_bearer(c))
         put("PlanColorStrip", self._plan_color_strip(c))
         put("PlanGripper", self._plan_gripper(c))
+        # Finished-format + pcs-per-roll (same desktop sources as the ProductMasterContents
+        # OutputType/PcsPerRoll columns, kept consistent):
+        #   Planfinishedformat <- Finish_Type ; PlanPcsPerRoll <- Finish_Qty_Per_Roll
+        put("Planfinishedformat", self._finish_type_value(c.get("Finish_Type")))
+        put("PlanPcsPerRoll", c.get("Finish_Qty_Per_Roll"))
         # ItemPlan* paper fields (desktop columns, or parsed from Paper_Search_String
         # when Paper_Quality/Mill is blank). Same values used in ContentSizeValues.
         _q, _g, _m, _f = self._paper_plan_fields(c)
@@ -1466,6 +1525,9 @@ class ProductMasterMigration(EntityMigration):
         put("ItemPlanGsm", _g)
         put("ItemPlanMill", _m)
         put("ItemPlanFinish", _f)
+        # ItemPlanThickness <- web ItemMaster.Thickness of the resolved paper; format
+        # it the same way the ContentSizeValues string does so both tables match.
+        put("ItemPlanThickness", self._fmt_size_value(self._paper_thickness(c)))
         # OperId: the process-id string for this content (resolved web ProcessIDs).
         put("OperId", self._content_oper_ids(self._k(c.get("Product_Content_ID"))))
         # links + context
@@ -1544,20 +1606,36 @@ class ProductMasterMigration(EntityMigration):
         self._load_paper_item_map()
         return self._paper_item_map.get(self._k(paper_id))
 
-    def _packing_for_item(self, item_id):
-        """(UnitPerPacking, PackingType) from the web ItemMaster for a resolved web
-        ItemID; (None, None) if unknown. Cached per instance — one company-scoped
-        query the first time it's needed."""
-        cache = getattr(self, "_item_packing_cache", None)
+    def _item_master_extras(self, item_id):
+        """(UnitPerPacking, PackingType, Thickness) from the web ItemMaster for a
+        resolved web ItemID; (None, None, None) if unknown. Cached per instance —
+        one company-scoped query the first time it's needed."""
+        cache = getattr(self, "_item_extras_cache", None)
         if cache is None:
             cache = {}
             for r in db.query_web(
-                    "SELECT ItemID, UnitPerPacking, PackingType FROM ItemMaster "
-                    "WHERE CompanyID=?", [self.company_id]):
+                    "SELECT ItemID, UnitPerPacking, PackingType, Thickness "
+                    "FROM ItemMaster WHERE CompanyID=?", [self.company_id]):
                 cache[self._k(r["ItemID"])] = (r.get("UnitPerPacking"),
-                                               r.get("PackingType"))
-            self._item_packing_cache = cache
-        return cache.get(self._k(item_id), (None, None))
+                                               r.get("PackingType"), r.get("Thickness"))
+            self._item_extras_cache = cache
+        return cache.get(self._k(item_id), (None, None, None))
+
+    def _packing_for_item(self, item_id):
+        """(UnitPerPacking, PackingType) from the web ItemMaster for a resolved web
+        ItemID; (None, None) if unknown."""
+        upp, ptype, _thk = self._item_master_extras(item_id)
+        return upp, ptype
+
+    def _paper_thickness(self, c):
+        """ItemPlanThickness = web ItemMaster.Thickness for this content's resolved
+        paper (ItemMaster.ItemID = ProductMasterContents.PaperID). SINGLE source for
+        both ProductMasterContentsSpecification.ItemPlanThickness and the
+        ContentSizeValues string, so the two never diverge."""
+        pid = self._item.resolve(c.get("Paper_ID"), required=False)
+        if pid is None:
+            return None
+        return self._item_master_extras(pid)[2]
 
     def _paper_consumption_process_id(self, src_content):
         """ProcessID of this content's operation flagged Paper_Consumption_Required

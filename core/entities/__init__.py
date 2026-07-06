@@ -39,6 +39,7 @@ from core.entities.process_children import (
     ToolGroupAllocationMigration,
 )
 from core.entities.machine_children import MachineItemSubGroupAllocationMigration
+from core.entities.machine_tool_allocation import MachineToolAllocationMigration
 from core.entities.flute_master import FluteMigration
 from core.entities.tool_children import ToolQCParameterMigration
 from core.entities.item_qc_parameters import (
@@ -77,6 +78,8 @@ MODULES = [
         _sub("", lambda **kw: ProcessMigration(**kw), "Operation_Master", "ProcessMaster")]},
     {"label": "Machine", "submodules": [
         _sub("", lambda **kw: MachineMigration(**kw), "Machine_Master", "MachineMaster")]},
+    {"label": "Machine Tool Allocation", "submodules": [
+        _sub("", lambda **kw: MachineToolAllocationMigration(**kw), "Cylinder_Machine_Allocation", "MachineToolAllocationMaster")]},
     {"label": "Material Sub-Group", "submodules": [
         _sub("", lambda **kw: MaterialGroupMigration(**kw), "Material_Group_Master", "ItemSubGroupMaster")]},
 
@@ -233,6 +236,7 @@ MIGRATION_ALL = [
     "Tool — Printing Cylinder", "Tool — Anilox Cylinder",
     "Tool — Embossing Cylinder", "Tool — Flexo Die", "Tool — Magnetic Cylinder",
     "Tool QC Parameter",
+    "Machine Tool Allocation",
     "Product Master",
 ]
 

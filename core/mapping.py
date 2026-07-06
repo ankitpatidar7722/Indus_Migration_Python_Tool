@@ -261,6 +261,30 @@ def ensure_group_fields(field_master_table: str, group_col: str, group_id: int,
     return added
 
 
+def _fmt_detail_value(v):
+    """Stringify an EAV FieldValue WITHOUT tacking a trailing '.0' onto a whole
+    number. The desktop stores GSM (and similar) as int OR real; pyodbc hands the
+    real ones back as Python float, so a plain str() turned 80 into '80.0'. Here a
+    whole numeric -> '80', a genuine decimal -> '80.5' (preserved), and bools /
+    text pass through str() unchanged (True/False, 'ART PAPER', …)."""
+    if v is None:
+        return ""
+    if isinstance(v, bool):
+        return str(v)
+    if isinstance(v, int):
+        return str(v)
+    if isinstance(v, float):
+        return str(int(v)) if v.is_integer() else str(v)
+    # Decimal or other numeric-like: drop a trailing '.0' only when whole.
+    try:
+        f = float(v)
+        if f.is_integer():
+            return str(int(f))
+    except (TypeError, ValueError):
+        pass
+    return str(v)
+
+
 def build_eav_detail_rows(detail_table: str, fk_col: str, group_col: str,
                           parent_id: int, group_id: int, parent_values: dict,
                           field_names: list[str], company_id: int, user_id: int,
@@ -282,7 +306,7 @@ def build_eav_detail_rows(detail_table: str, fk_col: str, group_col: str,
 
     def add(fname, fval):
         nonlocal seq
-        sval = "" if fval is None else str(fval)
+        sval = _fmt_detail_value(fval)
         full = [parent_id, group_id, fname, sval, fname, sval, company_id,
                 user_id, fyear, user_id, user_id, seq, 1, 0]
         rows.append([full[i] for i in keep])

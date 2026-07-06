@@ -156,12 +156,14 @@ class ProcessMigration(MappedEntity):
 
     @staticmethod
     def _module_type(raw) -> str:
-        """QA: desktop Module_Type 'Label' -> 'Flexo'; empty/blank -> 'Universal';
-        otherwise keep the desktop value (e.g. Offset, Common)."""
+        """Map desktop Module_Type -> web ProcessModuleType:
+          Label -> Flexo ; Common (or empty/blank) -> Universal ; Offset -> Offset ;
+          any other value is kept as-is."""
         s = (raw or "").strip()
-        if s.lower() == "label":
+        low = s.lower()
+        if low == "label":
             return "Flexo"
-        if s == "":
+        if low == "common" or s == "":
             return "Universal"
         return s
 
@@ -203,6 +205,20 @@ class ProcessMigration(MappedEntity):
                     vals[cols.index("ToolGroupID")] = tgid
                 else:
                     cols.append("ToolGroupID"); vals.append(tgid)
+        # QA: every process in DepartmentID 100 (printing dept) defaults to
+        # ProcessProductionType='Printing', regardless of the desktop value.
+        # DepartmentID is read AFTER super()/normalization (desktop 0 -> 100).
+        from core.mapping import _has_column
+        dept = vals[cols.index("DepartmentID")] if "DepartmentID" in cols else None
+        try:
+            is_dept_100 = int(dept) == 100
+        except (TypeError, ValueError):
+            is_dept_100 = False
+        if is_dept_100 and _has_column("ProcessMaster", "ProcessProductionType"):
+            if "ProcessProductionType" in cols:
+                vals[cols.index("ProcessProductionType")] = "Printing"
+            else:
+                cols.append("ProcessProductionType"); vals.append("Printing")
         return cols, vals
 
 
@@ -286,6 +302,7 @@ class MachineMigration(MappedEntity):
         "Min_Circumference": "MinCircumference",
         "Max_Circumference": "MaxCircumference",
         "Speed_Running_Meters": "SpeedRunningMeters",
+        "Variable_CutOff": "IsVariableCutOff",
     }
 
     # PrintingUnitID + Production_Unit_ID are real numeric FKs in source.
@@ -333,6 +350,12 @@ class MachineMigration(MappedEntity):
             vals[cols.index("CurrentStatus")] = "ACTIVE"
         else:
             cols.append("CurrentStatus"); vals.append("ACTIVE")
+
+        # IsActive is always 1 for every migrated machine, regardless of desktop.
+        if "IsActive" in cols:
+            vals[cols.index("IsActive")] = 1
+        else:
+            cols.append("IsActive"); vals.append(1)
 
         # Rule (QA #1320): seed the print sizes from the machine sizes —
         # MaxPrintL/W from Max_Length/Width, MinPrintL/W from Min_Length/Width.
