@@ -78,7 +78,9 @@ MODULES = [
         _sub("", lambda **kw: ProcessMigration(**kw), "Operation_Master", "ProcessMaster")]},
     {"label": "Machine", "submodules": [
         _sub("", lambda **kw: MachineMigration(**kw), "Machine_Master", "MachineMaster")]},
-    {"label": "Machine Tool Allocation", "submodules": [
+    # Not a standalone module — migrates automatically as a child of Machine
+    # (CHILDREN["Machine"]); hidden from the module dropdown.
+    {"label": "Machine Tool Allocation", "hidden": True, "submodules": [
         _sub("", lambda **kw: MachineToolAllocationMigration(**kw), "Cylinder_Machine_Allocation", "MachineToolAllocationMaster")]},
     {"label": "Material Sub-Group", "submodules": [
         _sub("", lambda **kw: MaterialGroupMigration(**kw), "Material_Group_Master", "ItemSubGroupMaster")]},
@@ -299,6 +301,7 @@ CHILDREN = {
         "Machine Online Coating Rates",
         "Machine Item Sub-Group Allocation",
         "Process Allocated Machine",
+        "Machine Tool Allocation",
     ],
     # Employee is now the Ledger → Employee sub-group; its machine allocation
     # migrates automatically with it.

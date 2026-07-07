@@ -256,12 +256,20 @@ def _coerce_for_type(kind: str, v):
     if kind == "bit":
         if isinstance(v, bool):
             return 1 if v else 0
+        # Numeric flags (incl. desktop 'real'/'float' columns like Variable_CutOff,
+        # which arrive as 1.0/0.0): any non-zero -> 1, zero -> 0.
+        if isinstance(v, (int, float)):
+            return 1 if v != 0 else 0
         s = str(v).strip().lower()
         if s in ("1", "true", "yes", "y"):
             return 1
         if s in ("0", "false", "no", "n", ""):
             return 0
-        return None
+        # numeric-looking strings ('1.0', '2', '0.0', ...)
+        try:
+            return 1 if float(s) != 0 else 0
+        except ValueError:
+            return None
     return v
 
 

@@ -74,10 +74,13 @@ class MachineToolAllocationMigration(MappedEntity):
     # ---- read (one row per record; shared ToolAllocatedIDString) ----------
     def read_source(self) -> list[dict]:
         tool_map = self._load_tool_map()
+        # Read ALL allocation rows (like Machine_Master is read whole) and let the
+        # web-side Tool/Machine resolution decide what migrates. Do NOT filter the
+        # DESKTOP table by self.company_id — that's the WEB company id and would read
+        # the wrong desktop company's rows.
         src = db.query_desktop(
             "SELECT Cylinder_ID, Machine_ID FROM Cylinder_Machine_Allocation "
-            "WHERE Company_ID=? ORDER BY Machine_ID, Cylinder_ID",
-            [self.company_id])
+            "ORDER BY Machine_ID, Cylinder_ID")
 
         resolved: list = []       # one entry per resolvable desktop record
         group_ids: dict = {}      # (MachineID, ToolGroupID) -> [ToolID, ...] distinct
