@@ -106,6 +106,7 @@ CONTENT_MAP = {
     "Content_Name": "PlanContName",
     "Orientation": "PlanContentType",
     "Quantity": "PlanContQty",
+    "No_Of_Sets_Of_Front_Back": "NoOfSets",
     "Machine_Name": "MachineName",
     "Machine_Colors": "MachineColors",
     "Paper_Size": "PaperSize",
@@ -513,6 +514,11 @@ class ProductMasterMigration(EntityMigration):
         self._machine = RefMap("MachineMaster", "RefMachineID", "MachineId", company_id=cid)
         self._process = RefMap("ProcessMaster", "RefProcessID", "ProcessID", company_id=cid)
         self._item = RefMap("ItemMaster", "RefItemID", "ItemID", company_id=cid)
+        # Paper_ID must resolve ONLY to a substrate item — Reel(2)/Roll(13)/Paper(14) —
+        # never a colliding RefItemID from another group. Used for ProductMasterContents
+        # .PaperID (and the paper-derived ItemPlanThickness / UnitPerPacking / Packing).
+        self._paper_ref = RefMap("ItemMaster", "RefItemID", "ItemID", company_id=cid,
+                                 group_col="ItemGroupID", group_ids=(2, 13, 14))
         # Desktop Material_ID -> the colour item's NON-substrate ItemMaster row as
         # (ItemID, ItemGroupID), excluding groups 2/13/14 (Reel/Roll/Paper) — those
         # share desktop id ranges with the Ink/Material items a colour row
@@ -637,7 +643,9 @@ class ProductMasterMigration(EntityMigration):
                 "Product_Master_ID", "Content_ID", "Product_Content_ID",
                 "Machine_ID", "Paper_ID", "Is_Planned", "Actual_Sheets",
                 "Paper_Rate", "Gripper_Main", "Paper_Search_String",
-                "Finish_Type", "Plan_Type"], ids, "Product_Master_ID"),
+                "Finish_Type", "Plan_Type", "Estimate_ID", "Content_Name",
+                "Ups_Total", "Back2Back_Pasting", "Machine_Type"],
+            ids, "Product_Master_ID"),
             "Product_Master_ID")
         self._ops = self._group(self._read_children(
             "Product_Master_Operations", list(self._process_map) + [
@@ -667,6 +675,111 @@ class ProductMasterMigration(EntityMigration):
             "Color_Details_Product", list(self._shade_map) + [
                 "Product_Content_ID", "Material_ID"],
             ids, "Product_Master_ID"), "Product_Content_ID")
+
+    @staticmethod
+    def _is_bookpages(c) -> bool:
+        """True when the content's Orientation is 'Book Pages' (web 'BookPages')."""
+        return str(c.get("Orientation") or "").replace(" ", "").strip().lower() == "bookpages"
+
+    @staticmethod
+    def _calc_book_forms(ups, quantity, pages, front, back, pasting=False,
+                         machine_type="", plan_type=""):
+        """Port of the desktop Calculate_Book_FormsMJ: build a book's form rows from
+        the content's own values (structural columns only — Forms/Sets/Pages/Sheets/
+        ImpressionsPerSet/FormsInPoint/FormPlanType). Rate/amount columns are NOT
+        produced here (the web fills those from its slab-rate engine).
+
+        The EFFECTIVE printing style is derived from the colours (Single Side when one
+        side is blank, else Front & Back) — the raw desktop Printing_Style is the press
+        style ('Work & Tumble' etc.) which the web overrides at plan time, so using it
+        would give the wrong split."""
+        import math
+        ru = lambda x: int(math.ceil(x - 1e-9))       # VB RoundUp(x,0)
+        rd = lambda x: int(math.floor(x + 1e-9))       # VB RoundDown(x)
+        ups = int(ups or 0)
+        if ups <= 0 or (pages or 0) <= 0:
+            return []
+        pages = int(pages); quantity = int(quantity or 0)
+        single = (front <= 0 or back <= 0)
+        style = "Single Side" if single else "Front & Back"
+        required = style
+        vk = 2 if (front > 0 and back > 0) else 1
+        if pasting:
+            pages = pages * 2
+        if str(plan_type).strip() == "Reel Planning":
+            style = "Front & Back"
+        ppf = ups * 2
+        sets = pages / ups
+        rows = []
+        # ---- Pass 0 : the full F_B form ----
+        fb_forms = 0; fb_pages = 0
+        if single:
+            fb_forms = rd(sets / 2); fb_sets = fb_forms; fb_pages = ppf * fb_forms
+            fb_sheets = quantity * fb_forms; fb_imps = fb_sheets; fpt = "Single Side"
+        elif required not in ("Work & Turn", "Work & Tumble"):
+            fb_forms = rd(sets / 2); fb_sets = fb_forms * 2; fb_pages = ppf * fb_forms
+            fb_sheets = quantity * fb_forms; fb_imps = fb_sheets * 2; fpt = "Front & Back"
+        if fb_forms > 0:
+            imps = fb_imps / fb_sets if fb_sets else 0
+            rows.append(dict(Forms=fb_forms, Sets=fb_sets, Pages=fb_pages,
+                             Sheets=fb_sheets, ImpressionsPerSet=imps,
+                             FormsInPoint=fb_forms, FormPlanType=fpt))
+        remaining = pages - fb_pages
+        wt = remaining / ups
+        flag4 = ups in (4, 8, 16, 32, 64, 128, 256)
+
+        def wt_fpt():
+            if fb_forms > 0:
+                if single:
+                    return "Single Side"
+                return "Front & Back" if str(plan_type).strip() == "Reel Planning" else "Work & Turn"
+            return required
+
+        # ---- Pass 1 : fact = 1 (or floor(remaining/ups) when press style is W&T) ----
+        fact = rd(remaining / ups) if style in ("Work & Turn", "Work & Tumble") else 1
+        if wt >= fact and fact != 0:
+            wt -= fact
+            impp = 1 if required in ("Work & Turn", "Work & Tumble") else ru(fact)
+            forms = ru(fact); sets_ = ru(fact) * impp
+            sheets = ru((quantity * fact) / 2)
+            imppset = ru((sheets * vk) / (forms * impp)) if forms * impp else 0
+            rows.append(dict(Forms=forms, Sets=sets_, Pages=round(fact * ups),
+                             Sheets=sheets, ImpressionsPerSet=imppset,
+                             FormsInPoint=fact, FormPlanType=wt_fpt()))
+            remaining = ru(remaining - fact * ups)
+
+        # ---- Pass 2 : fact = 0.5 (flag4) else remaining/ups ----
+        fact = 0.5 if flag4 else (remaining / ups if ups else 0)
+        if round(wt, 5) >= round(fact, 5) and fact != 0:
+            wt -= fact
+            impp = 1 if required in ("Work & Turn", "Work & Tumble") else ru(fact)
+            forms = ru(fact); sheets = ru((quantity * fact) / 2)
+            rows.append(dict(Forms=forms, Sets=ru(fact) * impp, Pages=round(fact * ups),
+                             Sheets=sheets, ImpressionsPerSet=sheets * vk,
+                             FormsInPoint=fact, FormPlanType=wt_fpt()))
+            remaining -= fact * ups
+
+        # ---- Passes 3..8 : fact = 0.25,0.125,... (flag4) else remaining/ups ----
+        for frac in (0.25, 0.125, 0.0625, 0.03125, 0.015625, 0.0078125):
+            fact = frac if flag4 else (remaining / ups if ups else 0)
+            if round(wt, 5) >= round(fact, 5) and fact != 0:
+                wt -= fact
+                if single:
+                    impp = ru((quantity * fact) / 2); fpt = "Single Side"
+                else:
+                    impp = ru((quantity * fact) / 2) * 2
+                    fpt = "Work & Turn" if fb_forms > 0 else required
+                forms = ru(fact)
+                rows.append(dict(Forms=forms, Sets=forms, Pages=round(fact * ups),
+                                 Sheets=ru((quantity * fact) / 2), ImpressionsPerSet=impp,
+                                 FormsInPoint=fact, FormPlanType=fpt))
+                remaining = remaining - fact * ups
+
+        if str(machine_type).strip() == "Web Offset":
+            for r in rows[1:]:
+                r["Sets"] = r["Sets"] * 2
+                r["ImpressionsPerSet"] = r["ImpressionsPerSet"] / 2
+        return rows
 
     def prepare_import(self):
         """Import-time setup: the import worker creates a FRESH entity and calls
@@ -922,6 +1035,47 @@ class ProductMasterMigration(EntityMigration):
             padded.append([m.get(name) for name in cols])
         engine.insert_child_rows(cursor, table, cols, padded)
 
+    def _book_form_rows(self, product_id, content_id, content_row):
+        """(cols, vals) ProductMasterContentBookForms rows for a 'Book Pages' content,
+        REGENERATED from the content's own values via _calc_book_forms (the desktop
+        Calculate_Book_FormsMJ algorithm). Only the structural columns are produced;
+        the rate/amount columns are left 0 (they come from the web slab-rate engine,
+        not the forms calc). FormPlanType/PlanID come from the calc / default."""
+        forms = self._calc_book_forms(
+            ups=self._num(content_row.get("Ups_Total")),
+            quantity=self._num(content_row.get("Quantity")),
+            pages=self._num(content_row.get("Pages")),
+            front=self._num(content_row.get("Front_Color")),
+            back=self._num(content_row.get("Back_Color")),
+            pasting=self._truthy(content_row.get("Back2Back_Pasting")),
+            machine_type=str(content_row.get("Machine_Type") or ""),
+            plan_type=str(content_row.get("Plan_Type") or ""))
+        if not forms:
+            return []
+        ctx = self._context("ProductMasterContentBookForms")
+        cname = content_row.get("Content_Name")
+        ptype = self._plan_content_type(content_row)
+        qty = content_row.get("Quantity")
+        out = []
+        for r in forms:
+            fields = {
+                "ProductMasterID": product_id, "ProductMasterContentsID": content_id,
+                "PlanContentType": ptype, "PlanContName": cname, "PlanContQty": qty,
+                "Forms": r["Forms"], "Sets": r["Sets"], "Pages": r["Pages"],
+                "Sheets": r["Sheets"], "ImpressionsPerSet": r["ImpressionsPerSet"],
+                "FormsInPoint": r["FormsInPoint"], "FormPlanType": r["FormPlanType"],
+                "PlanID": 1,
+                # rate/amount columns come from the web rate engine, not the forms
+                # calc — left at 0/blank on regen.
+                "ImprsToChargedPerSet": 0, "BasicRate": 0, "SlabRate": 0,
+                "RateType": None, "Amount": 0, "WastagePercentSheet": 0,
+                "PlateRate": 0, "WastageSheets": 0,
+            }
+            fields.update(ctx)
+            cols = [k for k in fields if _has_column("ProductMasterContentBookForms", k)]
+            out.append((cols, [fields[k] for k in cols]))
+        return out
+
     def _insert_grandchildren(self, cursor, product_id, content_id, src_content,
                               content_row=None):
         links_base = {"ProductMasterID": product_id,
@@ -932,7 +1086,9 @@ class ProductMasterMigration(EntityMigration):
         if content_row is not None:
             ctype = content_row.get("Orientation")
             if ctype is not None and str(ctype).strip() != "":
-                links_base["PlanContentType"] = ctype
+                # PlanContentType = Orientation with all spaces removed (consistent
+                # with the Specification/Contents rows and the material-req rows).
+                links_base["PlanContentType"] = self._plan_content_type(content_row)
         # Process. PlanContQty comes from the parent content (ProductMasterContents,
         # matched by ProductMasterContentsID); Rate is rounded to 4 decimals.
         content_qty = content_row.get("Quantity") if content_row is not None else None
@@ -1076,6 +1232,11 @@ class ProductMasterMigration(EntityMigration):
                     cols.append("PlanContQty"); vals.append(qty)
             shade_rows.append((cols, vals))
         self._batch_insert(cursor, "JobBookingColorDetails", shade_rows)
+        # Book forms — only for 'Book Pages' contents: transfer the desktop's stored
+        # forms for the plan whose Quantity matches this content's (exact/nearest).
+        if content_row is not None and self._is_bookpages(content_row):
+            self._batch_insert(cursor, "ProductMasterContentBookForms",
+                               self._book_form_rows(product_id, content_id, content_row))
 
     _tool_group_cache: dict | None = None
     _desktop_tool_type_cache: dict | None = None
@@ -1139,6 +1300,17 @@ class ProductMasterMigration(EntityMigration):
             return ("%.4f" % v).rstrip("0").rstrip(".")
         s = str(v).strip()
         return s
+
+    @staticmethod
+    def _plan_content_type(c):
+        """PlanContentType = desktop Orientation with ALL whitespace removed
+        ('Reverse Tuck In' -> 'ReverseTuckIn'). SINGLE source for every place that
+        stores PlanContentType (ProductMasterContents, the Specification row, the
+        ContentSizeValues string, and the process/tool child rows), so they agree."""
+        v = c.get("Orientation")
+        if v is None:
+            return None
+        return _re.sub(r"\s+", "", str(v))
 
     @staticmethod
     def _is_label(c) -> bool:
@@ -1299,6 +1471,9 @@ class ProductMasterMigration(EntityMigration):
         # PlanOnlineCoating must match ProductMasterContentsSpecification.PlanOnlineCoating
         # (both = desktop Online_Coating), for consistency between the two.
         derived["PlanOnlineCoating"] = c.get("Online_Coating")
+        # PlanContentType = Orientation with all spaces removed (same value written to
+        # ProductMasterContents / the Specification row).
+        derived["PlanContentType"] = self._plan_content_type(c)
         if self._is_label(c):
             # Label: SizeWidth uses Job_Length; SizeLength is not populated (0).
             derived["SizeWidth"] = c.get("Job_Length")
@@ -1358,6 +1533,11 @@ class ProductMasterMigration(EntityMigration):
         # the Specification row as Planfinishedformat / PlanPcsPerRoll).
         put("OutputType", self._finish_type_value(c.get("Finish_Type")))
         put("PcsPerRoll", c.get("Finish_Qty_Per_Roll"))
+        # PlanContentType = Orientation with all spaces removed (overrides the raw
+        # CONTENT_MAP value; matches the Specification row + ContentSizeValues).
+        put("PlanContentType", self._plan_content_type(c))
+        # PlanID is a fixed default 1 for every content, regardless of desktop.
+        put("PlanID", 1)
         # links + generated content no
         put("ProductMasterID", product_id)
         put("ProductMasterCode", pm_code)
@@ -1370,9 +1550,10 @@ class ProductMasterMigration(EntityMigration):
         mid = self._machine.resolve(c.get("Machine_ID"), required=False)
         if mid is not None:
             put("MachineID", mid)
-        pid = self._item.resolve(c.get("Paper_ID"), required=False)
-        if pid is not None:
-            put("PaperID", pid)
+        pid = self._paper_ref.resolve(c.get("Paper_ID"), required=False)
+        # PaperID = the resolved substrate ItemID; 0 when Paper_ID has NO match in the
+        # Reel/Roll/Paper groups (2/13/14) — never left NULL.
+        put("PaperID", pid if pid is not None else 0)
         # UnitPerPacking / Packing — ONLY when the content's domain type is OFFSET
         # (same PlanContDomainType stored in ProductMasterContentsSpecification).
         # Pull from the resolved paper's web ItemMaster row (ItemMaster.ItemID = PaperID):
@@ -1454,6 +1635,10 @@ class ProductMasterMigration(EntityMigration):
         # form (W instead of L).
         name = (c.get("Orientation") or "").strip().lower()
         h, l, w = n("Job_Height"), n("Job_Length"), n("Job_Width")
+        if self._is_bookpages(c):
+            # BookPages: H, L and the total pages (JobNoOfPages = desktop Pages);
+            # comma-separated, no flap parts.  e.g. "H:200,L:180,Pages:80"
+            return f"H:{h},L:{l},Pages:{n('Pages')}"
         if name == "label":
             s = f"H:{h};W:{l};"
         elif name == "rectangular":
@@ -1513,6 +1698,9 @@ class ProductMasterMigration(EntityMigration):
         put("PlanPlateBearer", self._plan_plate_bearer(c))
         put("PlanColorStrip", self._plan_color_strip(c))
         put("PlanGripper", self._plan_gripper(c))
+        # PlanContentType = Orientation with all spaces removed ('Reverse Tuck In'
+        # -> 'ReverseTuckIn').
+        put("PlanContentType", self._plan_content_type(c))
         # Finished-format + pcs-per-roll (same desktop sources as the ProductMasterContents
         # OutputType/PcsPerRoll columns, kept consistent):
         #   Planfinishedformat <- Finish_Type ; PlanPcsPerRoll <- Finish_Qty_Per_Roll
@@ -1632,7 +1820,7 @@ class ProductMasterMigration(EntityMigration):
         paper (ItemMaster.ItemID = ProductMasterContents.PaperID). SINGLE source for
         both ProductMasterContentsSpecification.ItemPlanThickness and the
         ContentSizeValues string, so the two never diverge."""
-        pid = self._item.resolve(c.get("Paper_ID"), required=False)
+        pid = self._paper_ref.resolve(c.get("Paper_ID"), required=False)
         if pid is None:
             return None
         return self._item_master_extras(pid)[2]
@@ -1766,6 +1954,13 @@ class ProductMasterMigration(EntityMigration):
         n = self._next_booking_no()
         booking_no = f"{n}.0"
         final_cost, type_of_cost = self._est_costs(row.get("Estimate_ID"))
+        # Round the cost to 3 decimals up front so JobBooking/JobApprovedCost store
+        # rounded values WITHOUT a separate post-insert UPDATE round-trip.
+        try:
+            if final_cost not in (None, ""):
+                final_cost = round(float(final_cost), 3)
+        except (TypeError, ValueError):
+            pass
         now = self._now
 
         # 1) JobBooking (auto BookingID). Copy the product's applicable fields.
@@ -1805,11 +2000,17 @@ class ProductMasterMigration(EntityMigration):
         cols, vals = self._filtered_cols("JobApprovedCost", ja)
         engine.insert_one_row(cursor, "JobApprovedCost", cols, vals)
 
-        # 3) Stamp the new BookingID on the product + all its related tables.
-        for t in self._booking_id_tables():
-            cursor.execute(
-                f"UPDATE [{t}] SET BookingID=? WHERE ProductMasterID=?",
-                [booking_id, product_id])
+        # 3) Stamp the new BookingID on the product + all its related tables. Send all
+        # the UPDATEs in ONE round-trip (a batch of statements) instead of ~12 — the
+        # biggest per-product network cost when migrating to a remote server.
+        tables = self._booking_id_tables()
+        if tables:
+            sql = ";".join(
+                f"UPDATE [{t}] SET BookingID=? WHERE ProductMasterID=?" for t in tables)
+            params = []
+            for _t in tables:
+                params.extend([booking_id, product_id])
+            cursor.execute(sql, params)
 
 
 # value-fit helper that reuses the engine's truncation

@@ -32,6 +32,9 @@ _ROLES = (DESKTOP, WEB)
 # Global connections, one per role
 _connections: dict[str, pyodbc.Connection | None] = {DESKTOP: None, WEB: None}
 _info: dict[str, tuple[str, str]] = {DESKTOP: ("", ""), WEB: ("", "")}
+# Full credentials kept in memory so a dropped connection can be transparently
+# re-established (reconnect) during a long migration over a flaky remote link.
+_creds: dict[str, tuple] = {}
 
 
 # ----------------------------------------------------------------------------
@@ -88,17 +91,70 @@ def _save_role_settings(role: str, server: str, database: str,
 # ----------------------------------------------------------------------------
 # Connection string
 # ----------------------------------------------------------------------------
+# Driver choice is the single biggest performance factor over a network. The
+# legacy 'SQL Server' driver is slow AND does not support pyodbc's
+# fast_executemany, so batch child inserts silently degrade to one round-trip
+# per row — fine locally, catastrophic on a remote server. We therefore prefer a
+# modern 'ODBC Driver NN for SQL Server' (fast + fast_executemany) and only fall
+# back to the legacy driver if nothing better is installed / it fails to connect.
+_PREFERRED_DRIVERS = [
+    "ODBC Driver 18 for SQL Server",
+    "ODBC Driver 17 for SQL Server",
+    "ODBC Driver 13.1 for SQL Server",
+    "ODBC Driver 13 for SQL Server",
+    "ODBC Driver 11 for SQL Server",
+    "SQL Server Native Client 11.0",
+    "SQL Server",                       # legacy fallback (slow; no fast_executemany)
+]
+_driver_order: list[str] | None = None
+
+
+def available_sql_drivers() -> list[str]:
+    """Installed SQL Server ODBC drivers, best-first. Cached."""
+    global _driver_order
+    if _driver_order is None:
+        try:
+            installed = set(pyodbc.drivers())
+        except Exception:
+            installed = set()
+        _driver_order = [d for d in _PREFERRED_DRIVERS if d in installed] or ["SQL Server"]
+    return _driver_order
+
+
 def build_connection_string(server: str, database: str,
                             username: str = "INDUS",
-                            password: str = "Param@99811") -> str:
-    return (
-        f"DRIVER={{SQL Server}};"
-        f"SERVER={server};"
-        f"DATABASE={database};"
-        f"UID={username};"
-        f"PWD={password};"
-        f"TrustServerCertificate=yes;"
-    )
+                            password: str = "Param@99811",
+                            driver: str | None = None) -> str:
+    drv = driver or available_sql_drivers()[0]
+    s = (f"DRIVER={{{drv}}};"
+         f"SERVER={server};"
+         f"DATABASE={database};"
+         f"UID={username};"
+         f"PWD={password};")
+    # Modern drivers: skip TLS on the (trusted) LAN — matches the legacy driver's
+    # unencrypted behaviour, avoids cert prompts, and shaves per-connect overhead.
+    # ConnectRetry* lets the driver transparently recover an idle-dropped connection
+    # (helps over flaky remote/VPS links); harmless on a LAN.
+    if drv != "SQL Server":
+        s += "Encrypt=no;ConnectRetryCount=3;ConnectRetryInterval=10;"
+    s += "TrustServerCertificate=yes;"
+    return s
+
+
+def _connect_any(server: str, database: str, username: str, password: str,
+                 timeout: int = 10) -> pyodbc.Connection:
+    """Open a connection trying each installed driver best-first; raise the last
+    error only if every driver fails (so a modern-driver hiccup still falls back
+    to the legacy driver and connectivity never regresses)."""
+    last_err: Exception | None = None
+    for drv in available_sql_drivers():
+        try:
+            return pyodbc.connect(
+                build_connection_string(server, database, username, password, driver=drv),
+                timeout=timeout)
+        except pyodbc.Error as e:
+            last_err = e
+    raise last_err or pyodbc.Error("No usable SQL Server ODBC driver found")
 
 
 # ----------------------------------------------------------------------------
@@ -113,16 +169,29 @@ def connect(role: str, server: str, database: str,
     if role not in _ROLES:
         raise ValueError(f"Unknown connection role: {role!r}")
 
-    conn_str = build_connection_string(server, database, username, password)
-    conn = pyodbc.connect(conn_str, timeout=10)
+    conn = _connect_any(server, database, username, password, timeout=30)
     conn.autocommit = False
 
     # Replace any existing connection for this role
     close(role)
     _connections[role] = conn
     _info[role] = (server, database)
+    _creds[role] = (server, database, username, password)
     _save_role_settings(role, server, database, username, password)
     return True
+
+
+def reconnect(role: str) -> bool:
+    """Re-open a role's connection using the last-used credentials — for recovering
+    a dropped link mid-migration. Raises if there are no stored credentials."""
+    c = _creds.get(role)
+    if not c:
+        raise RuntimeError(f"No stored credentials to reconnect {role!r}.")
+    return connect(role, *c)
+
+
+def reconnect_web() -> bool:
+    return reconnect(WEB)
 
 
 def connect_desktop(server, database, username, password) -> bool:
@@ -200,8 +269,7 @@ def query_web(sql: str, params=None) -> list[dict]:
 
 def list_databases(server: str, username: str, password: str) -> list[str]:
     """Connect to a server's master DB and list online user databases."""
-    conn_str = build_connection_string(server, "master", username, password)
-    conn = pyodbc.connect(conn_str, timeout=10)
+    conn = _connect_any(server, "master", username, password, timeout=10)
     try:
         cursor = conn.cursor()
         cursor.execute(

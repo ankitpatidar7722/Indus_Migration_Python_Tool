@@ -328,11 +328,17 @@ def build_eav_detail_rows(detail_table: str, fk_col: str, group_col: str,
 # ----------------------------------------------------------------------------
 class RefMap:
     def __init__(self, table: str, ref_col: str, id_col: str,
-                 company_id: int | None = None):
+                 company_id: int | None = None,
+                 group_col: str | None = None, group_ids=None):
         self.table = table
         self.ref_col = ref_col
         self.id_col = id_col
         self.company_id = company_id
+        # Optional group restriction (e.g. ItemMaster ItemGroupID IN (2,13,14) so a
+        # desktop Paper_ID only ever resolves to a substrate item, never a colliding
+        # RefItemID from another group).
+        self.group_col = group_col
+        self.group_ids = list(group_ids) if group_ids else None
         self._map: dict | None = None
 
     def _load(self):
@@ -342,6 +348,10 @@ class RefMap:
         if self.company_id is not None and _has_column(self.table, "CompanyID"):
             where += " AND CompanyID=?"
             params.append(self.company_id)
+        if self.group_col and self.group_ids and _has_column(self.table, self.group_col):
+            ph = ",".join("?" for _ in self.group_ids)
+            where += f" AND [{self.group_col}] IN ({ph})"
+            params.extend(self.group_ids)
         rows = db.query_web(
             f"SELECT [{self.ref_col}] AS r, [{self.id_col}] AS i "
             f"FROM [{self.table}] {where} AND [{self.ref_col}] IS NOT NULL",

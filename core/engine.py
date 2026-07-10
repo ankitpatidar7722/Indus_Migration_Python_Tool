@@ -21,9 +21,10 @@ the row-shaping logic.
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Callable, Iterable
+from typing import Callable
 
 import pyodbc
 
@@ -652,46 +653,100 @@ def import_preview(entity: EntityMigration, preview: PreviewResult,
 _COMMIT_BATCH = 50
 
 
+# How many times to re-establish a dropped connection and retry before giving up.
+_CONN_RETRIES = 4
+
+
+def _is_connection_error(ex) -> bool:
+    """True for errors that mean the physical DB connection dropped (so a reconnect
+    + retry is worth it) rather than a bad record. Covers ODBC 08xxx SQLSTATEs and
+    the 'Communication link failure' text over a flaky remote link."""
+    state = ""
+    args = getattr(ex, "args", None)
+    if args:
+        state = str(args[0])
+    blob = (state + " " + str(ex))
+    return any(m in blob for m in (
+        "08S01", "08003", "08007", "08004", "08001", "08S02", "HYT00", "HY000",
+        "Communication link failure", "Named Pipes Provider", "TCP Provider",
+        "connection is closed", "Connection is busy"))
+
+
+def _safe_rollback(conn):
+    try:
+        conn.rollback()
+    except Exception:
+        pass
+
+
+def _reconnect_web(attempt: int):
+    """Re-establish the dropped web connection with a short backoff."""
+    time.sleep(min(2 ** attempt, 15))     # 1, 2, 4, 8, 15… seconds
+    db.reconnect_web()
+
+
 def _commit_in_batches(web, items, do_one, result, progress, stop_flag, total):
     """Insert `items` (each via do_one(item, cursor)), committing every
-    _COMMIT_BATCH successfully-inserted records. If a batch commit fails because
-    one record is bad, the batch is rolled back and RE-RUN one-record-per-commit
-    so only the actual bad record fails and every good record still migrates.
-    This keeps per-record error isolation while committing in bulk on the happy
-    path."""
+    _COMMIT_BATCH records. On a BAD record the batch is re-run one-per-commit so
+    only the bad one fails. On a CONNECTION drop (remote link failure) the web
+    connection is re-established and the batch is retried — so a flaky network no
+    longer aborts the whole migration. The live connection is always fetched fresh
+    from db.get_web() so it follows a reconnect."""
     i = 0
     n = len(items)
     while i < n:
         if stop_flag and stop_flag():
             break
         batch = items[i:i + _COMMIT_BATCH]
+        _run_batch(batch, do_one, result, stop_flag)
+        i += len(batch)
+        if progress:
+            progress(min(i, total), total, f"{min(i, total)}/{total}")
+
+
+def _run_batch(batch, do_one, result, stop_flag):
+    """Try the whole batch in one transaction, reconnecting+retrying on a dropped
+    link. On a non-connection failure (a bad record) fall through to row-by-row."""
+    for attempt in range(_CONN_RETRIES):
+        web = db.get_web()
         cursor = web.cursor()
         done = []                          # (item, target_id) staged this batch
         try:
             for it in batch:
-                pid = do_one(it, cursor)
-                done.append((it, pid))
+                done.append((it, do_one(it, cursor)))
             web.commit()
             for it, pid in done:
                 result.add(RecordResult(it.source_key, Outcome.INSERTED,
                                         target_id=pid, message=it.message))
-        except Exception:
-            # A record in this batch is bad — undo the whole batch, then retry it
-            # record-by-record so the good ones still land and only the bad fails.
-            web.rollback()
-            for it in batch:
-                if stop_flag and stop_flag():
-                    break
-                c = web.cursor()
-                try:
-                    pid = do_one(it, c)
-                    web.commit()
-                    result.add(RecordResult(it.source_key, Outcome.INSERTED,
-                                            target_id=pid, message=it.message))
-                except Exception as ex:
-                    web.rollback()
-                    result.add(RecordResult(it.source_key, Outcome.FAILED,
-                                            message=str(ex)))
-        i += len(batch)
-        if progress:
-            progress(min(i, total), total, f"{min(i, total)}/{total}")
+            return
+        except Exception as ex:
+            _safe_rollback(web)
+            if _is_connection_error(ex) and attempt < _CONN_RETRIES - 1:
+                _reconnect_web(attempt)
+                continue                   # retry the batch on the fresh connection
+            break                          # bad record (or out of retries) -> row-by-row
+    for it in batch:
+        if stop_flag and stop_flag():
+            break
+        _run_one(it, do_one, result)
+
+
+def _run_one(it, do_one, result):
+    """One record in its own transaction, reconnecting+retrying on a dropped link;
+    a genuine bad record is marked FAILED and the run continues."""
+    for attempt in range(_CONN_RETRIES):
+        web = db.get_web()
+        cursor = web.cursor()
+        try:
+            pid = do_one(it, cursor)
+            web.commit()
+            result.add(RecordResult(it.source_key, Outcome.INSERTED,
+                                    target_id=pid, message=it.message))
+            return
+        except Exception as ex:
+            _safe_rollback(web)
+            if _is_connection_error(ex) and attempt < _CONN_RETRIES - 1:
+                _reconnect_web(attempt)
+                continue
+            result.add(RecordResult(it.source_key, Outcome.FAILED, message=str(ex)))
+            return
