@@ -30,3 +30,8 @@ Product Catalog Save/
 .idea/
 *.swp
 .DS_Store
+
+# Large DB artifacts (backups / exports) - never commit
+*.bak
+*.bacpac
+IndusEnterpriseShreedharLabel_schema_data.sql

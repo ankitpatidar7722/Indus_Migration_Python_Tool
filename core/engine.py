@@ -410,9 +410,14 @@ def _has_max_column(table: str, columns: list[str]) -> bool:
 
 
 def reset_schema_caches() -> None:
-    """Drop cached table-schema info. Call after any ALTER TABLE done at runtime
-    (e.g. adding RefToolId / DesktopProductMasterID) so the new column is seen."""
+    """Drop ALL cached target-schema info (MAX-column flags, string widths, column
+    kinds). Call after a runtime ALTER TABLE, AND whenever the web connection points
+    at a different database — so value-fitting always uses the CURRENT database's real
+    column widths/types (otherwise a stale, wider width lets an over-long value through
+    and SQL Server rejects it, e.g. LedgerMaster.TelephoneNo)."""
     _max_col_cache.clear()
+    _str_len_cache.clear()
+    _coltype_cache.clear()
 
 
 def _insert_children(cursor: pyodbc.Cursor, table: str, columns: list[str],

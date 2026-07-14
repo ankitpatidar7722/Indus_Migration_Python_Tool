@@ -39,6 +39,7 @@ CONTENT_NAME_ALIASES = {
 }
 
 _content_map_cache: dict | None = None
+_content_name_cache: dict | None = None
 
 
 def _norm_name(s) -> str:
@@ -56,6 +57,23 @@ def resolve_content_id(orientation_name) -> int:
     key = _norm_name(orientation_name)
     key = CONTENT_NAME_ALIASES.get(key, key)   # apply alias if any
     return _content_map_cache.get(key, 0)
+
+
+def resolve_content_name(orientation_name):
+    """Return the CANONICAL web ContentMaster.ContentName whose normalized form (all
+    whitespace + special characters removed, lower-cased) matches the desktop
+    orientation — None if no match. Matching is normalized on BOTH sides, but the
+    ACTUAL stored ContentName is returned, e.g. 'Cake Box' -> 'Cake-Box'."""
+    global _content_name_cache
+    if _content_name_cache is None:
+        rows = db.query_web(
+            "SELECT ContentName FROM ContentMaster WHERE ISNULL(ContentName,'')<>''")
+        _content_name_cache = {}
+        for r in rows:
+            _content_name_cache.setdefault(_norm_name(r["ContentName"]), r["ContentName"])
+    key = _norm_name(orientation_name)
+    key = CONTENT_NAME_ALIASES.get(key, key)
+    return _content_name_cache.get(key)
 
 
 _content_domain_cache: dict | None = None
@@ -459,6 +477,22 @@ def _load_country_state(company_id):
 
 
 _branch_id_cache: dict = {}
+
+
+def reset_target_caches() -> None:
+    """Clear cached WEB(target)-DB schema + lookups so a DIFFERENT target database is
+    read fresh: column existence, ContentMaster / ItemSubGroup / Branch / field-master
+    maps. (Desktop-side caches are left alone.) Called when the web connection changes."""
+    global _content_map_cache, _content_name_cache, _content_domain_cache
+    global _subgroup_name_cache, _material_group_names
+    _col_cache.clear()
+    _field_master_cache.clear()
+    _branch_id_cache.clear()
+    _content_map_cache = None
+    _content_name_cache = None
+    _content_domain_cache = None
+    _subgroup_name_cache = None
+    _material_group_names = None
 
 
 def resolve_branch_id(company_id, desktop_branch_id=None) -> int | None:

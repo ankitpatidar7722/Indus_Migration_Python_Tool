@@ -40,6 +40,7 @@ from core.entities.process_children import (
 )
 from core.entities.machine_children import MachineItemSubGroupAllocationMigration
 from core.entities.machine_tool_allocation import MachineToolAllocationMigration
+from core.entities.material_cost_estimation import MaterialCostEstimationMigration
 from core.entities.flute_master import FluteMigration
 from core.entities.tool_children import ToolQCParameterMigration
 from core.entities.item_qc_parameters import (
@@ -82,6 +83,8 @@ MODULES = [
     # (CHILDREN["Machine"]); hidden from the module dropdown.
     {"label": "Machine Tool Allocation", "hidden": True, "submodules": [
         _sub("", lambda **kw: MachineToolAllocationMigration(**kw), "Cylinder_Machine_Allocation", "MachineToolAllocationMaster")]},
+    {"label": "Material Cost Estimation", "submodules": [
+        _sub("", lambda **kw: MaterialCostEstimationMigration(**kw), "Material_Group_Costing_Field_Master", "MaterialCostEstimationSetting")]},
     {"label": "Material Sub-Group", "submodules": [
         _sub("", lambda **kw: MaterialGroupMigration(**kw), "Material_Group_Master", "ItemSubGroupMaster")]},
 

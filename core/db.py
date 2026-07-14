@@ -178,7 +178,27 @@ def connect(role: str, server: str, database: str,
     _info[role] = (server, database)
     _creds[role] = (server, database, username, password)
     _save_role_settings(role, server, database, username, password)
+    # The web (target) schema caches are keyed by table name only, so a new/changed
+    # target DB must invalidate them — otherwise stale column widths let over-long
+    # values slip past value-fitting and SQL Server rejects them.
+    if role == WEB:
+        _reset_target_caches()
     return True
+
+
+def _reset_target_caches():
+    """Drop cached target(web)-schema info after the web connection changes. Lazy
+    imports keep db.py free of engine/mapping import cycles."""
+    try:
+        from core import engine
+        engine.reset_schema_caches()
+    except Exception:
+        pass
+    try:
+        from core import mapping
+        mapping.reset_target_caches()
+    except Exception:
+        pass
 
 
 def reconnect(role: str) -> bool:

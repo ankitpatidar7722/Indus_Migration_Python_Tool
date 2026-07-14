@@ -32,7 +32,8 @@ import re as _re
 
 from core import db, engine
 from core.engine import EntityMigration
-from core.mapping import RefMap, _has_column, resolve_content_domain_type
+from core.mapping import (RefMap, _has_column, resolve_content_domain_type,
+                          resolve_content_name)
 
 
 def _norm(s):
@@ -1303,14 +1304,16 @@ class ProductMasterMigration(EntityMigration):
 
     @staticmethod
     def _plan_content_type(c):
-        """PlanContentType = desktop Orientation with ALL whitespace removed
-        ('Reverse Tuck In' -> 'ReverseTuckIn'). SINGLE source for every place that
-        stores PlanContentType (ProductMasterContents, the Specification row, the
-        ContentSizeValues string, and the process/tool child rows), so they agree."""
+        """PlanContentType = the CANONICAL ContentMaster.ContentName whose normalized
+        form (whitespace + special chars removed) matches the desktop Orientation —
+        e.g. Orientation 'Cake Box' -> stored 'Cake-Box'. Falls back to the Orientation
+        with whitespace removed when no ContentMaster row matches. SINGLE source for
+        every place that stores PlanContentType (ProductMasterContents, the
+        Specification row, the ContentSizeValues string, the process/tool child rows)."""
         v = c.get("Orientation")
         if v is None:
             return None
-        return _re.sub(r"\s+", "", str(v))
+        return resolve_content_name(v) or _re.sub(r"\s+", "", str(v))
 
     @staticmethod
     def _is_label(c) -> bool:
